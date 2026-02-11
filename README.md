@@ -5,6 +5,14 @@ A program to check WCAG contrast rules for foreground/background colors.
 I've had this in my home toolbox for years, but recently needed this on another
 machine, so I'm making it available so I can find it again.
 
+Updated in 2026 to optionally try to find the smallest perceptual change in
+foreground or background lightness (or both, or also hue, see options!) to make
+the contrast pass WCAG AA or AAA, for large or normal text, depending on the
+options passed: I had a need to see by how much a color that passes AA for small
+or large text already needed to change in order to also pass AAA for small or
+large text, such that "just a bit more change" might be enough to meet the
+higher, but better, standard.
+
 ## Usage
 
 At its simplest, you can pass a FOREGROUND and a BACKGROUND color, in hex
@@ -69,9 +77,35 @@ fg 000000 hsl(0°, 0%, 0%)      on eeeeee hsl(0°, 0%, 93%)     = EXAMPLE = 18.1
 fg 111111 hsl(0°, 0%, 6%)      on eeeeee hsl(0°, 0%, 93%)     = EXAMPLE = 16.275:1 contrast ✔PASS AA  large ✔PASS AAA large ✔PASS AA  text ✔PASS AAA text
 ```
 
+Alternatively, you can use one (or more) of `-aa`, `-aaa`, `-AA`, `-AAA` to
+specify your "target" WCAG level, and the program will try to find the smallest
+change in lightness (or hue, see options) to make the contrast pass that level,
+using a number of algorithms (by default all, can opt in to using only `--hsl`, 
+`--oklab`, `--cielab`), and output the new foreground/background colors, the
+contrast ratio, and the "EXAMPLE" text colored with the new colors, i.e.:
+
+```bash
+$ ./contrast a0a0a0 ca0000 -aaa -l
+fg a0a0a0 hsl(0°, 0%, 62%)     on ca0000 hsl(0°, 100%, 39%)   = EXAMPLE =  2.287:1 contrast ✘FAIL AA  large ✘FAIL AAA large ✘FAIL AA  text ✘FAIL AAA text
+fg c7c7c7 hsl(0°, 0%, 78%)     on 760000 hsl(0°, 100%, 23%)   = EXAMPLE =  7.017:1 contrast ✔PASS AA  large ✔PASS AAA large ✔PASS AA  text ✔PASS AAA text BEST: algo=hsl    distance=0.3093
+fg ffffff hsl(0°, 0%, 100%)    on 150000 hsl(0°, 100%, 4%)    = EXAMPLE = 20.351:1 contrast ✔PASS AA  large ✔PASS AAA large ✔PASS AA  text ✔PASS AAA text       algo=oklab  distance=0.7309
+fg d8d8d8 hsl(0°, 0%, 84%)     on 890000 hsl(0°, 100%, 26%)   = EXAMPLE =  7.140:1 contrast ✔PASS AA  large ✔PASS AAA large ✔PASS AA  text ✔PASS AAA text       algo=cielab distance=0.3183
+```
+
+As further options, when using one of `-aa`, `-aaa`, `-AA` or `-AAA` you can
+specify `--keep-bg` or `--keep-fg` to keep that color fixed, and only change
+the other one; `--hue-shift` to _allow_ changes in hue (by default only
+lightness is changed); and `--ratio=F:B` (not allowed if `--keep-bg` or
+`--keep-fg` is used) to specify a custom ligthness ratio to try when shifting
+both foreground and background (by default 1:1, i.e. the same change in
+lightness is applied to both foreground and background), i.e. `--ratio=2:1` to
+try to change the foreground lightness twice as much as the background
+lightness, or `--ratio=1:2` to try to change the background lightness twice as
+much as the foreground lightness.
+
 ## LICENSE
 
-Copyright 2023 Marco Fontani <MFONTANI@cpan.org>
+Copyright 2023-2026 Marco Fontani <MFONTANI@cpan.org>
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

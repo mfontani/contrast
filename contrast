@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# Copyright 2023 Marco Fontani <MFONTANI@cpan.org>
+# Copyright 2023-2026 Marco Fontani <MFONTANI@cpan.org>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -29,26 +29,48 @@
 use 5.020_001;
 use warnings;
 use List::Util qw<max min>;
-use POSIX qw<floor>;
+use POSIX qw<ceil floor>;
 use open qw<:std :utf8>;
 
 sub usage {
     my ($reason) = @_;
 
     my $usage = <<'END_USAGE';
-Usage: contrast FOREGROUND BACKGROUND [-l]
+Usage: contrast FOREGROUND BACKGROUND [OPTIONS]
 
 Shows WCAG contrast for the FOREGROUND on BACKGROUND color.
 
 FOREGROUND and BACKGROUND are meant to be HEX colors. The # is optional.
 
 Options:
-    -l      Show all data in one line.
-Note options come LAST.
+    -l              Show all data in one line.
+    -AA             If FOREGROUND/BACKGROUND does not pass "AA" for large text,
+                    try to find the closest color that would.
+    -AAA            Same as -AA, but for "AAA" for large text.
+    -aa             Same as -AA, but for "AA" for normal (not large) text.
+    -aaa            Same as -AA, but for "AAA" for normal (not large) text.
+
+Options used when one of -aa/-aaa/-AA/-AAA is given:
+Adjustment options:
+    --keep-fg       Keep the foreground color fixed; only adjust background.
+    --keep-bg       Keep the background color fixed; only adjust foreground.
+    --ratio=F:B     Move foreground and background lightness with ratio F:B
+                    (default: 1:1 when neither --keep-* nor --ratio is given).
+    --hue-shift     Allow small hue shifts as a last resort when lightness-only
+                    adjustments cannot find a satisfactory solution.
+Algorithm selection:
+    --hsl           Use the HSL-based adjustment algorithm.
+    --oklab         Use the OKLab-based adjustment algorithm.
+    --cielab        Use the CIELAB-based adjustment algorithm.
+If none of the algorithms are specifically selected, the result of all of them
+is showcased, and the smallest-change solution highlighted.
 
 Examples:
     contrast ff0000 000000
     for f in ff0000 aa0000; for b in 000000 333333; do contrast "$f" "$b" -l; done
+    contrast ff0000 660000 -AA
+    contrast ff0000 660000 -AA --keep-bg
+    contrast ff0000 660000 -aa --oklab --ratio=2:1
 END_USAGE
 
     die "ERROR: $reason\n$usage\n"
@@ -60,34 +82,421 @@ END_USAGE
 usage()
     if !scalar @ARGV
     || scalar grep { $_ eq '-h' || $_ eq '--help' } @ARGV;
+
 my $foreground = shift @ARGV or usage('Need FOREGROUND & BACKGROUND');
 my $background = shift @ARGV or usage('Need FOREGROUND & BACKGROUND');
-my $one_line   = 0;
-if (@ARGV && $ARGV[0] eq '-l') {
-    $one_line = 1;
-    shift @ARGV;
+my $contrast;
+
+my $one_line       = 0;
+my $find_aa        = 0;
+my $find_aaa       = 0;
+my $find_AA        = 0;
+my $find_AAA       = 0;
+my $keep_fg        = 0;
+my $keep_bg        = 0;
+my $ratio_fg       = 1;
+my $ratio_bg       = 1;
+my @algo_allowed   = qw<hsl oklab cielab>;
+my %algo_allowed   = map { $_ => 1 } @algo_allowed;
+my %algo_requested = ();
+my $hue_shift      = 0;
+
+{
+    for (@ARGV) {
+        if ($_ eq '-l') {
+            $one_line = 1;
+        }
+        elsif ($_ eq '-aa') {
+            $find_aa = 1;
+        }
+        elsif ($_ eq '-aaa') {
+            $find_aaa = 1;
+        }
+        elsif ($_ eq '-AA') {
+            $find_AA = 1;
+        }
+        elsif ($_ eq '-AAA') {
+            $find_AAA = 1;
+        }
+        elsif ($_ eq '--keep-fg') {
+            $keep_fg = 1;
+        }
+        elsif ($_ eq '--keep-bg') {
+            $keep_bg = 1;
+        }
+        elsif (m!\A --ratio = (\d+) : (\d+) \z!xms) {
+            ($ratio_fg, $ratio_bg) = ($1, $2);
+        }
+        elsif ($_ eq '--hue-shift') {
+            $hue_shift = 1;
+        }
+        else {
+            my $got_algo = 0;
+            for my $algo (@algo_allowed) {
+                if ($_ eq "--$algo") {
+                    $algo_requested{$algo} = 1;
+                    $got_algo = 1;
+                    next;
+                }
+            }
+            next if $got_algo;
+            usage("Unknown option: '$_'");
+        }
+    }
+
+    usage("Cannot use both --keep-fg and --keep-bg\n")
+        if $keep_fg
+        && $keep_bg;
+
+    if ($keep_fg) {
+        $ratio_fg = 0;
+        $ratio_bg = 1;
+    }
+    elsif ($keep_bg) {
+        $ratio_fg = 1;
+        $ratio_bg = 0;
+    }
+
+    usage("Foreground doesn't match #RRGGBB: '$foreground'\n")
+        if $foreground !~ m!\A [#]? [0-9a-f]{6} \z!ixms;
+    usage("Background doesn't match #RRGGBB: '$background'\n")
+        if $background !~ m!\A [#]? [0-9a-f]{6} \z!ixms;
+
+    $contrast = contrast($foreground, $background);
+    say matrix_for($foreground, $background);
+
+    find_pass($contrast, 1, \&passes_aa) if $find_AA;
+    find_pass($contrast, 1, \&passes_aaa) if $find_AAA;
+    find_pass($contrast, 0, \&passes_aa) if $find_aa;
+    find_pass($contrast, 0, \&passes_aaa) if $find_aaa;
+
+    exit 0;
 }
-usage('Too many arguments.')
-    if @ARGV;
 
-usage("Foreground doesn't match #RRGGBB: '$foreground'\n")
-    if $foreground !~ m!\A [#]? [0-9a-f]{6} \z!ixms;
-usage("Background doesn't match #RRGGBB: '$background'\n")
-    if $background !~ m!\A [#]? [0-9a-f]{6} \z!ixms;
+sub matrix_for {
+    my ($fg, $bg) = @_;
 
-my $contrast = contrast($foreground, $background);
-say sprintf 'fg %s %s%son %s %s%s = %s%s = %8s contrast%s%s',
-    as_ansi($foreground, '', $foreground), nice_hex2hsl($foreground),
-    $one_line ? ' ' : "\n",
-    as_ansi($background, '', $background), nice_hex2hsl($background),
-    $one_line ? '' : "\n",
-    as_ansi($foreground, $background, 'EXAMPLE'),
-    $one_line ? '' : "\n",
-    (sprintf '%.3f:1', $contrast),
-    $one_line ? ' ' : "\n",
-    aa_matrix($contrast, !$one_line);
+    my $c = contrast($fg, $bg);
 
-exit 0;
+    return sprintf 'fg %s %s%son %s %s%s = %s%s = %8s contrast%s%s',
+        as_ansi($fg, '', $fg), nice_hex2hsl($fg),
+        $one_line ? ' ' : "\n",
+        as_ansi($bg, '', $bg), nice_hex2hsl($bg),
+        $one_line ? '' : "\n",
+        as_ansi($fg, $bg, 'EXAMPLE'),
+        $one_line ? '' : "\n",
+        (sprintf '%.3f:1', $c),
+        $one_line ? ' ' : "\n",
+        aa_matrix($c, !$one_line);
+}
+
+sub find_pass {
+    my ($contrast, $is_large, $test_sub) = @_;
+
+    my @algos = @algo_allowed;
+    if (keys %algo_requested) {
+        @algos = sort keys %algo_requested;
+    }
+
+    my $best_overall;
+    my @per_algo_results;
+
+    for my $algo (@algos) {
+        my $res = adjust_colors_algo(
+            orig_fg         => $foreground,
+            orig_bg         => $background,
+            is_large        => $is_large,
+            test_sub        => $test_sub,
+            ratio_fg        => $ratio_fg,
+            ratio_bg        => $ratio_bg,
+            allow_hue_shift => $hue_shift,
+            algo_name       => $algo,
+        );
+        next if !$res;
+        push @per_algo_results, { %$res, algo => $algo };
+        if (!$best_overall || $res->{distance} < $best_overall->{distance}) {
+            $best_overall = { %$res, algo => $algo };
+        }
+    }
+
+    if (!$best_overall) {
+        say sprintf 'Could not find a color that passes %s for %s text with the requested constraints.',
+            $test_sub == \&passes_aa ? 'AA' : 'AAA', $is_large ? 'large' : 'small';
+        return;
+    }
+
+    my $new_fg = $best_overall->{fg};
+    my $new_bg = $best_overall->{bg};
+    my $algo   = $best_overall->{algo};
+    $contrast  = contrast($new_fg, $new_bg);
+
+    say matrix_for($new_fg, $new_bg) . ($one_line ? ' ' : "\n") .
+        sprintf 'BEST: algo=%-6s distance=%.4f', $algo, $best_overall->{distance};
+
+    # Also print per-algorithm suggestions if more than one.
+    if (@per_algo_results > 1) {
+        for my $res (@per_algo_results) {
+            next if $res->{algo} eq $algo; # already printed as primary
+            my $fg = $res->{fg};
+            my $bg = $res->{bg};
+            my $c  = contrast($fg, $bg);
+            say matrix_for($fg, $bg) . ($one_line ? ' ' : "\n") .
+                sprintf '      algo=%-6s distance=%.4f', $res->{algo}, $res->{distance};
+        }
+    }
+}
+
+sub adjust_colors_algo {
+    my (%args) = @_;
+
+    my $algo = $args{algo_name};
+    return undef
+        if !defined $algo;
+
+    return adjust_hsl(%args) if $algo eq 'hsl';
+    return adjust_oklab(%args) if $algo eq 'oklab';
+    return adjust_cielab(%args) if $algo eq 'cielab';
+
+    return undef;
+}
+
+sub _search_lightness_1d {
+    my (%args) = @_;
+
+    my $orig_fg         = $args{orig_fg};
+    my $orig_bg         = $args{orig_bg};
+    my $ratio_fg        = $args{ratio_fg} || 0;
+    my $ratio_bg        = $args{ratio_bg} || 0;
+    my $test_sub        = $args{test_sub};
+    my $is_large        = $args{is_large};
+    my $convert_in      = $args{convert_in};
+    my $convert_out     = $args{convert_out};
+    my $get_L           = $args{get_L};
+    my $set_L           = $args{set_L};
+    my $min_L           = $args{min_L};
+    my $max_L           = $args{max_L};
+    my $allow_hue_shift = $args{allow_hue_shift} // 0;
+
+    my ($cf, $sf) = $convert_in->($orig_fg);
+    my ($cb, $sb) = $convert_in->($orig_bg);
+
+    my $Lf0 = $get_L->($cf);
+    my $Lb0 = $get_L->($cb);
+
+    my $lum_fg = luminance($orig_fg);
+    my $lum_bg = luminance($orig_bg);
+    my $fg_is_lighter = $lum_fg >= $lum_bg ? 1 : 0;
+
+    my $sum_ratio = $ratio_fg + $ratio_bg;
+    $sum_ratio = 1 if $sum_ratio <= 0; # avoid div by zero
+
+    my $step_mag = ($max_L - $min_L) / 100; # 100 steps over full range
+    $step_mag = 1 if $step_mag < 1;
+
+    my $sign_fg = $fg_is_lighter ? 1 : -1;
+    my $sign_bg = $fg_is_lighter ? -1 : 1;
+
+    my $best;
+
+    # Phase 1: lightness-only search
+    for my $n (1..100) {
+        my $delta = $step_mag * $n;
+        my $dLf   = $ratio_fg ? $sign_fg * $delta * ($ratio_fg / $sum_ratio) : 0;
+        my $dLb   = $ratio_bg ? $sign_bg * $delta * ($ratio_bg / $sum_ratio) : 0;
+        my $Lf    = $Lf0 + $dLf;
+        my $Lb    = $Lb0 + $dLb;
+
+        $Lf = $max_L if $Lf > $max_L;
+        $Lf = $min_L if $Lf < $min_L;
+        $Lb = $max_L if $Lb > $max_L;
+        $Lb = $min_L if $Lb < $min_L;
+
+        my $cf_new = { %$cf };
+        my $cb_new = { %$cb };
+        $set_L->($cf_new, $Lf);
+        $set_L->($cb_new, $Lb);
+
+        my $new_fg = $convert_out->($cf_new, $sf);
+        my $new_bg = $convert_out->($cb_new, $sb);
+
+        my $c = contrast($new_fg, $new_bg);
+        next if !$test_sub->($c, $is_large);
+
+        my $dist = color_distance_oklab_pair($orig_fg, $orig_bg, $new_fg, $new_bg);
+        if (!$best || $dist < $best->{distance}) {
+            $best = {
+                fg       => $new_fg,
+                bg       => $new_bg,
+                contrast => $c,
+                distance => $dist,
+            };
+        }
+    }
+
+    # If we found something without hue shift, or hue shift is not allowed, stop here.
+    return $best
+        if $best
+        || !$allow_hue_shift;
+
+    # Phase 2: allow small hue/channel shifts around the original.
+    my @hue_offsets = ( -10, -5, 5, 10 );
+
+    for my $n (1..100) {
+        my $delta = $step_mag * $n;
+        my $dLf = $ratio_fg ? $sign_fg * $delta * ($ratio_fg / $sum_ratio) : 0;
+        my $dLb = $ratio_bg ? $sign_bg * $delta * ($ratio_bg / $sum_ratio) : 0;
+
+        for my $hoff (@hue_offsets) {
+            my $Lf = $Lf0 + $dLf;
+            my $Lb = $Lb0 + $dLb;
+
+            $Lf = $max_L if $Lf > $max_L;
+            $Lf = $min_L if $Lf < $min_L;
+            $Lb = $max_L if $Lb > $max_L;
+            $Lb = $min_L if $Lb < $min_L;
+
+            my $cf_new = { %$cf };
+            my $cb_new = { %$cb };
+            $set_L->($cf_new, $Lf);
+            $set_L->($cb_new, $Lb);
+
+            # Allow the converter to interpret hue shifts as needed; for non-HSL
+            # spaces this may be a no-op if the converter ignores the extra data.
+            $cf_new->{h} += $hoff if exists $cf_new->{h};
+            $cb_new->{h} += $hoff if exists $cb_new->{h};
+
+            my $new_fg = $convert_out->($cf_new, $sf);
+            my $new_bg = $convert_out->($cb_new, $sb);
+
+            my $c = contrast($new_fg, $new_bg);
+            next if !$test_sub->($c, $is_large);
+
+            my $dist = color_distance_oklab_pair($orig_fg, $orig_bg, $new_fg, $new_bg);
+            # Slightly penalise hue-shifted solutions so pure lightness wins ties.
+            $dist *= 1.05;
+
+            if (!$best || $dist < $best->{distance}) {
+                $best = {
+                    fg       => $new_fg,
+                    bg       => $new_bg,
+                    contrast => $c,
+                    distance => $dist,
+                };
+            }
+        }
+    }
+
+    return $best;
+}
+
+sub adjust_hsl {
+    my (%args) = @_;
+
+    my $orig_fg  = $args{orig_fg};
+    my $orig_bg  = $args{orig_bg};
+    my $ratio_fg = $args{ratio_fg};
+    my $ratio_bg = $args{ratio_bg};
+
+    my $convert_in = sub {
+        my ($hex) = @_;
+        my ($h, $s, $l) = hex2hsl($hex);
+        return ({ h => $h, s => $s, l => $l }, undef);
+    };
+    my $convert_out = sub {
+        my ($c, undef) = @_;
+        my ($r, $g, $b) = hsl2rgb($c->{h}, $c->{s}, $c->{l});
+        return sprintf '%02x%02x%02x', $r, $g, $b;
+    };
+    my $get_L = sub { $_[0]->{l} };
+    my $set_L = sub { $_[0]->{l} = $_[1] };
+
+    return _search_lightness_1d(
+        %args,
+        orig_fg         => $orig_fg,
+        orig_bg         => $orig_bg,
+        ratio_fg        => $ratio_fg,
+        ratio_bg        => $ratio_bg,
+        allow_hue_shift => $args{allow_hue_shift},
+        convert_in      => $convert_in,
+        convert_out     => $convert_out,
+        get_L           => $get_L,
+        set_L           => $set_L,
+        min_L           => 0,
+        max_L           => 100,
+    );
+}
+
+sub adjust_oklab {
+    my (%args) = @_;
+
+    my $orig_fg  = $args{orig_fg};
+    my $orig_bg  = $args{orig_bg};
+    my $ratio_fg = $args{ratio_fg};
+    my $ratio_bg = $args{ratio_bg};
+
+    my $convert_in = sub {
+        my ($hex) = @_;
+        my ($L, $A, $B) = hex2oklab($hex);
+        return ({ L => $L, A => $A, B => $B }, undef);
+    };
+    my $convert_out = sub {
+        my ($c, undef) = @_;
+        return oklab2hex($c->{L}, $c->{A}, $c->{B});
+    };
+    my $get_L = sub { $_[0]->{L} };
+    my $set_L = sub { $_[0]->{L} = $_[1] };
+
+    return _search_lightness_1d(
+        %args,
+        orig_fg    => $orig_fg,
+        orig_bg    => $orig_bg,
+        ratio_fg   => $ratio_fg,
+        ratio_bg   => $ratio_bg,
+        allow_hue_shift => $args{allow_hue_shift},
+        convert_in  => $convert_in,
+        convert_out => $convert_out,
+        get_L       => $get_L,
+        set_L       => $set_L,
+        min_L       => 0,
+        max_L       => 1,
+    );
+}
+
+sub adjust_cielab {
+    my (%args) = @_;
+
+    my $orig_fg  = $args{orig_fg};
+    my $orig_bg  = $args{orig_bg};
+    my $ratio_fg = $args{ratio_fg};
+    my $ratio_bg = $args{ratio_bg};
+
+    my $convert_in = sub {
+        my ($hex) = @_;
+        my ($L, $A, $B) = hex2lab($hex);
+        return ({ L => $L, A => $A, B => $B }, undef);
+    };
+    my $convert_out = sub {
+        my ($c, undef) = @_;
+        return lab2hex($c->{L}, $c->{A}, $c->{B});
+    };
+    my $get_L = sub { $_[0]->{L} };
+    my $set_L = sub { $_[0]->{L} = $_[1] };
+
+    return _search_lightness_1d(
+        %args,
+        orig_fg         => $orig_fg,
+        orig_bg         => $orig_bg,
+        ratio_fg        => $ratio_fg,
+        ratio_bg        => $ratio_bg,
+        allow_hue_shift => $args{allow_hue_shift},
+        convert_in      => $convert_in,
+        convert_out     => $convert_out,
+        get_L           => $get_L,
+        set_L           => $set_L,
+        min_L           => 0,
+        max_L           => 100,
+    );
+}
 
 sub hex2rgb {
     my ($rgb) = @_;
@@ -104,16 +513,179 @@ sub hex2rgb {
 sub luminance {
     my ($rgb) = @_;
     my ($r, $g, $b) = hex2rgb($rgb);
-    my @luminance = map {
-        my $v = $_;
-        $v /= 255;
-        $v <= 0.03928 ? $v / 12.92 : (($v + 0.055)/1.055) ** 2.4
-    } ($r, $g, $b);
+    my @luminance = map { srgb_to_linear($_ / 255) } ($r, $g, $b);
     return 0 +
         $luminance[0] * 0.2126 +
         $luminance[1] * 0.7152 +
         $luminance[2] * 0.0722 +
         0;
+}
+
+sub srgb_to_linear {
+    my ($v) = @_;
+    return $v <= 0.03928 ? $v / 12.92 : (($v + 0.055)/1.055) ** 2.4;
+}
+
+sub linear_to_srgb {
+    my ($v) = @_;
+    return 12.92 * $v if $v <= 0.0031308;
+    return 1.055 * ($v ** (1/2.4)) - 0.055;
+}
+
+sub hex2oklab {
+    my ($rgb) = @_;
+    my ($r8, $g8, $b8) = hex2rgb($rgb);
+    my $r = srgb_to_linear($r8 / 255);
+    my $g = srgb_to_linear($g8 / 255);
+    my $b = srgb_to_linear($b8 / 255);
+
+    my $l = 0.4122214708 * $r + 0.5363325363 * $g + 0.0514459929 * $b;
+    my $m = 0.2119034982 * $r + 0.6806995451 * $g + 0.1073969566 * $b;
+    my $s = 0.0883024619 * $r + 0.2817188376 * $g + 0.6299787005 * $b;
+
+    my $l_ = $l ** (1/3);
+    my $m_ = $m ** (1/3);
+    my $s_ = $s ** (1/3);
+
+    my $L = 0.2104542553 * $l_ + 0.7936177850 * $m_ - 0.0040720468 * $s_;
+    my $A = 1.9779984951 * $l_ - 2.4285922050 * $m_ + 0.4505937099 * $s_;
+    my $B = 0.0259040371 * $l_ + 0.7827717662 * $m_ - 0.8086757660 * $s_;
+
+    return ($L, $A, $B);
+}
+
+sub oklab2hex {
+    my ($L, $A, $B) = @_;
+
+    my $l_ = $L + 0.3963377774 * $A + 0.2158037573 * $B;
+    my $m_ = $L - 0.1055613458 * $A - 0.0638541728 * $B;
+    my $s_ = $L - 0.0894841775 * $A - 1.2914855480 * $B;
+
+    my $l = $l_ ** 3;
+    my $m = $m_ ** 3;
+    my $s = $s_ ** 3;
+
+    my $r_lin = 4.0767416621 * $l - 3.3077115913 * $m + 0.2309699292 * $s;
+    my $g_lin = -1.2684380046 * $l + 2.6097574011 * $m - 0.3413193965 * $s;
+    my $b_lin = -0.0041960863 * $l - 0.7034186147 * $m + 1.7076147010 * $s;
+
+    my $r = linear_to_srgb($r_lin);
+    my $g = linear_to_srgb($g_lin);
+    my $b = linear_to_srgb($b_lin);
+
+    $r = 0 if $r < 0;
+    $g = 0 if $g < 0;
+    $b = 0 if $b < 0;
+    $r = 1 if $r > 1;
+    $g = 1 if $g > 1;
+    $b = 1 if $b > 1;
+
+    my $r8 = int($r * 255 + 0.5);
+    my $g8 = int($g * 255 + 0.5);
+    my $b8 = int($b * 255 + 0.5);
+
+    return sprintf '%02x%02x%02x', $r8, $g8, $b8;
+}
+
+sub hex2lab {
+    my ($rgb) = @_;
+
+    my ($r8, $g8, $b8) = hex2rgb($rgb);
+
+    my $r = srgb_to_linear($r8 / 255);
+    my $g = srgb_to_linear($g8 / 255);
+    my $b = srgb_to_linear($b8 / 255);
+
+    my $X = 0.4124 * $r + 0.3576 * $g + 0.1805 * $b;
+    my $Y = 0.2126 * $r + 0.7152 * $g + 0.0722 * $b;
+    my $Z = 0.0193 * $r + 0.1192 * $g + 0.9505 * $b;
+
+    my $Xn = 0.95047;
+    my $Yn = 1.00000;
+    my $Zn = 1.08883;
+
+    my $fx = _lab_f($X / $Xn);
+    my $fy = _lab_f($Y / $Yn);
+    my $fz = _lab_f($Z / $Zn);
+
+    my $L = 116 * $fy - 16;
+    my $A = 500 * ($fx - $fy);
+    my $B = 200 * ($fy - $fz);
+
+    return ($L, $A, $B);
+}
+
+sub lab2hex {
+    my ($L, $A, $B) = @_;
+
+    my $Xn = 0.95047;
+    my $Yn = 1.00000;
+    my $Zn = 1.08883;
+
+    my $fy = ($L + 16) / 116;
+    my $fx = $A / 500 + $fy;
+    my $fz = $fy - $B / 200;
+
+    my $X = $Xn * _lab_f_inv($fx);
+    my $Y = $Yn * _lab_f_inv($fy);
+    my $Z = $Zn * _lab_f_inv($fz);
+
+    my $r_lin = 3.2406 * $X - 1.5372 * $Y - 0.4986 * $Z;
+    my $g_lin = -0.9689 * $X + 1.8758 * $Y + 0.0415 * $Z;
+    my $b_lin = 0.0557 * $X - 0.2040 * $Y + 1.0570 * $Z;
+
+    my $r = linear_to_srgb($r_lin);
+    my $g = linear_to_srgb($g_lin);
+    my $b = linear_to_srgb($b_lin);
+
+    $r = 0 if $r < 0;
+    $g = 0 if $g < 0;
+    $b = 0 if $b < 0;
+    $r = 1 if $r > 1;
+    $g = 1 if $g > 1;
+    $b = 1 if $b > 1;
+
+    my $r8 = int($r * 255 + 0.5);
+    my $g8 = int($g * 255 + 0.5);
+    my $b8 = int($b * 255 + 0.5);
+
+    return sprintf '%02x%02x%02x', $r8, $g8, $b8;
+}
+
+sub _lab_f {
+    my ($t) = @_;
+
+    my $delta = 6/29;
+    return $t > $delta**3 ? $t ** (1/3) : ($t / (3 * $delta**2)) + 4/29;
+}
+
+sub _lab_f_inv {
+    my ($t) = @_;
+
+    my $delta = 6/29;
+    my $t3 = $t ** 3;
+    return $t3 > $delta**3 ? $t3 : 3 * $delta**2 * ($t - 4/29);
+}
+
+sub color_distance_oklab_pair {
+    my ($orig_fg, $orig_bg, $new_fg, $new_bg) = @_;
+
+    my ($L1f, $A1f, $B1f) = hex2oklab($orig_fg);
+    my ($L2f, $A2f, $B2f) = hex2oklab($new_fg);
+    my ($L1b, $A1b, $B1b) = hex2oklab($orig_bg);
+    my ($L2b, $A2b, $B2b) = hex2oklab($new_bg);
+
+    my $dfL = $L1f - $L2f;
+    my $dfA = $A1f - $A2f;
+    my $dfB = $B1f - $B2f;
+    my $dbL = $L1b - $L2b;
+    my $dbA = $A1b - $A2b;
+    my $dbB = $B1b - $B2b;
+
+    my $df = sqrt($dfL*$dfL + $dfA*$dfA + $dfB*$dfB);
+    my $db = sqrt($dbL*$dbL + $dbA*$dbA + $dbB*$dbB);
+
+    return $df + $db;
 }
 
 sub contrast {
@@ -125,6 +697,18 @@ sub contrast {
     return ($brightest + 0.05) / ($darkest + 0.05);
 }
 
+sub passes_aa {
+    my ($contrast, $is_large) = @_;
+    return $contrast >= 3.0 && $is_large
+        || $contrast >= 4.5 && !$is_large;
+}
+
+sub passes_aaa {
+    my ($contrast, $is_large) = @_;
+    return $contrast >= 4.5 && $is_large
+        || $contrast >= 7.0 && !$is_large;
+}
+
 sub aa_matrix {
     my ($contrast, $use_newline) = @_;
 
@@ -132,13 +716,14 @@ sub aa_matrix {
     my $FAIL = sprintf "\e[3;31m\N{HEAVY BALLOT X}FAIL\e[0m";
 
     return sprintf '%s AA  large%s%s AAA large%s%s AA  text%s%s AAA text',
-        $contrast > 3.0 ? $PASS : $FAIL,
+        passes_aa($contrast, 1) ? $PASS : $FAIL,
         $use_newline ? "\n" : ' ',
-        $contrast > 5.0 ? $PASS : $FAIL,
+        passes_aaa($contrast, 1) ? $PASS : $FAIL,
         $use_newline ? "\n" : ' ',
-        $contrast > 5.0 ? $PASS : $FAIL,
+        passes_aa($contrast, 0) ? $PASS : $FAIL,
         $use_newline ? "\n" : ' ',
-        $contrast > 7.0 ? $PASS : $FAIL,
+        passes_aaa($contrast, 0) ? $PASS : $FAIL,
+        ;
 }
 
 sub as_ansi {
